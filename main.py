@@ -18,15 +18,18 @@ class Colors:
 
 # API
 load_dotenv()
-API_KEY = os.getenv('API_KEY')
-if not API_KEY:
-    raise RuntimeError('API Key not found')
+PIWIGO_USER = os.getenv("USERNAME")
+PIWIGO_PASSWORD = os.getenv("PASSWORD")
+if not PIWIGO_USER or not PIWIGO_PASSWORD:
+    raise ValueError("Piwigo credentials not found.")
+session = requests.Session()
+
 
 ALT_API_KEY = os.getenv('ALT_TEXT_API')
 if not ALT_API_KEY:
     raise RuntimeError('Alt API Key not found')
 
-HEADERS = {'X-PIWIGO-API': API_KEY}
+BASE_URL = 'https://mines.piwigo.com/ws.php?format=json'
 MAX_IMAGE_BYTES = 1_500_000
 
 
@@ -60,11 +63,10 @@ def load_lazy(page: Page):
     page.wait_for_timeout(250)
 
 
-def api_post(method: str, data: dict, files=None):
-    payload = {'method': method, **data}
-    r = requests.post(
-        'https://mines.piwigo.com/ws.php?format=json',
-        headers=HEADERS,
+def api_post(method: str, data: dict = None, files=None):
+    payload = {'method': method, **(data or {})}
+    r = session.post(
+        BASE_URL,
         data=payload,
         files=files,
         timeout=30,
@@ -80,9 +82,18 @@ def api_post(method: str, data: dict, files=None):
         raise RuntimeError(f'Non-JSON response from Piwigo: {text[:300]}')
 
     if js.get('stat') == 'fail':
-        raise RuntimeError(f'{method} failed: {js.get('err')} {js.get('message')}')
+        raise RuntimeError(f"{method} failed: {js.get('err')} {js.get('message')}")
 
     return js['result']
+
+def login():
+    api_post('pwg.session.login', {
+        'username': PIWIGO_USER,
+        'password': PIWIGO_PASSWORD,
+    })
+
+def logout():
+    api_post('pwg.session.logout')
 
 
 def ensure_header(path, header, delimiter='\t'):
@@ -187,144 +198,149 @@ def main():
             browser = p.chromium.launch(headless=False)
             page = browser.new_page()
 
-            photo_count = 0
-            for filepath in directory.iterdir():
-                photo_count += 1
+            login()
 
-                # skip other files
-                file = filepath.name
-                if not file.startswith('Depositphotos_') or not file.endswith('_XL.jpg'):
-                    continue
+            try:
+                photo_count = 0
+                for filepath in directory.iterdir():
+                    photo_count += 1
 
-                # get photo id/search url from filename
-                deposit_id = file.removeprefix('Depositphotos_').removesuffix('_XL.jpg')
-                search_url = 'https://depositphotos.com/search/' + deposit_id
-
-                print(f'ID: {deposit_id}')
-
-                if deposit_id in completed_ids:
-                    print(f'{Colors.YELLOW}Already completed{Colors.RESET}\n')
-                    continue
-
-                # generate alt text for image
-                alt_text = alttext_from_file(str(filepath), ALT_API_KEY)
-
-                # pull info from deposit photos
-                page.goto(search_url)
-
-                deposit_url = page.url
-                print(deposit_url)
-
-                # title
-                # there is only one h1 element so this is reliable
-                try:
-                    title_locator = page.locator('h1')
-                    title_locator.wait_for(timeout=10_000)
-                    title = title_locator.inner_text().strip()
-
-                    if title.endswith(' — Photo'):
-                        title = title.removesuffix(' — Photo')
-
-                    elif title.endswith(' — Vector'):
-                        title = title.removesuffix(' — Vector')
-
-                    if title == 'Sorry, but we haven\'t found anything':
-                        print(f'{Colors.RED}Could not find photo ID {deposit_id} on Deposit Photos search{Colors.RESET}')
-                        failed.writerow([filepath, deposit_id, 'Gathering Title', 'Photo doesn\'t exist on deposit photos'])
+                    # skip other files
+                    file = filepath.name
+                    if not file.startswith('Depositphotos_') or not file.endswith('_XL.jpg'):
                         continue
 
-                    print(f'Title: {title}')
-                except Exception as e:
-                    failed.writerow([filepath, deposit_id, 'Gathering Title', str(e)])
-                    continue
+                    # get photo id/search url from filename
+                    deposit_id = file.removeprefix('Depositphotos_').removesuffix('_XL.jpg')
+                    search_url = 'https://depositphotos.com/search/' + deposit_id
 
-                # author
-                try:
-                    author_locator = page.locator('._wdeBj')
-                    author_locator.wait_for(timeout=10_000)
+                    print(f'ID: {deposit_id}')
 
-                    author = author_locator.inner_text().strip()
+                    if deposit_id in completed_ids:
+                        print(f'{Colors.YELLOW}Already completed{Colors.RESET}\n')
+                        continue
 
-                    if 'Photo by ' in author:
-                        _, _, author = author.partition('Photo by ')
-                    elif 'Vector by ' in author:
-                        _, _, author = author.partition('Vector by ')
+                    # generate alt text for image
+                    alt_text = alttext_from_file(str(filepath), ALT_API_KEY)
 
-                    print(f'Author: {author}')
-                except Exception as e:
-                    failed.writerow([filepath, deposit_id, 'Gathering Author', str(e)])
-                    continue
+                    # pull info from deposit photos
+                    page.goto(search_url)
 
-                # alt-text printing from before
-                print(f'Alt Text: {alt_text}')
+                    deposit_url = page.url
+                    print(deposit_url)
 
-                # keywords
-                seen = set()
-                keywords = []
+                    # title
+                    # there is only one h1 element so this is reliable
+                    try:
+                        title_locator = page.locator('h1')
+                        title_locator.wait_for(timeout=10_000)
+                        title = title_locator.inner_text().strip()
 
-                load_lazy(page)
+                        if title.endswith(' — Photo'):
+                            title = title.removesuffix(' — Photo')
 
-                try:
-                    ul_locator = page.locator('._U57rH').last
-                    keywords_locator = ul_locator.locator('li')
-                    num_keywords = keywords_locator.count()
+                        elif title.endswith(' — Vector'):
+                            title = title.removesuffix(' — Vector')
 
-                    print('Keywords: ', end='')
-                    for i in range(num_keywords):
-                        li = keywords_locator.nth(i)
-                        keyword = li.inner_text().strip().lower()
-                        keywords.append(keyword)
-                        seen.add(keyword)
-                        print(keyword, end=', ')
-                    print()
-                except Exception as e:
-                    failed.writerow([filepath, deposit_id, 'Gathering Keywords', str(e)])
-                    continue
+                        if title == 'Sorry, but we haven\'t found anything':
+                            print(f'{Colors.RED}Could not find photo ID {deposit_id} on Deposit Photos search{Colors.RESET}')
+                            failed.writerow([filepath, deposit_id, 'Gathering Title', 'Photo doesn\'t exist on deposit photos'])
+                            continue
 
-                # max amount is 50 keywords
-                keywords = keywords[:50]
-                keywords_cell = ';'.join(keywords)
+                        print(f'Title: {title}')
+                    except Exception as e:
+                        failed.writerow([filepath, deposit_id, 'Gathering Title', str(e)])
+                        continue
 
-                description = f"""
+                    # author
+                    try:
+                        author_locator = page.locator('._wdeBj')
+                        author_locator.wait_for(timeout=10_000)
+
+                        author = author_locator.inner_text().strip()
+
+                        if 'Photo by ' in author:
+                            _, _, author = author.partition('Photo by ')
+                        elif 'Vector by ' in author:
+                            _, _, author = author.partition('Vector by ')
+
+                        print(f'Author: {author}')
+                    except Exception as e:
+                        failed.writerow([filepath, deposit_id, 'Gathering Author', str(e)])
+                        continue
+
+                    # alt-text printing from before
+                    print(f'Alt Text: {alt_text}')
+
+                    # keywords
+                    seen = set()
+                    keywords = []
+
+                    load_lazy(page)
+
+                    try:
+                        ul_locator = page.locator('._U57rH').last
+                        keywords_locator = ul_locator.locator('li')
+                        num_keywords = keywords_locator.count()
+
+                        print('Keywords: ', end='')
+                        for i in range(num_keywords):
+                            li = keywords_locator.nth(i)
+                            keyword = li.inner_text().strip().lower()
+                            keywords.append(keyword)
+                            seen.add(keyword)
+                            print(keyword, end=', ')
+                        print()
+                    except Exception as e:
+                        failed.writerow([filepath, deposit_id, 'Gathering Keywords', str(e)])
+                        continue
+
+                    # max amount is 50 keywords
+                    keywords = keywords[:50]
+                    keywords_cell = ';'.join(keywords)
+
+                    description = f"""
 Alt Text: {alt_text}
 Source URL: {deposit_url}
 Publisher: DepositPhotos
 Attribution: {author}/DepositPhotos
 """
 
-                # Publish to Piwigo
-                try:
-                    tags = ','.join(keywords)
-                    payload = {
-                        'category': 3,
-                        'name': title,
-                        'author': author,
-                        'comment': description,
-                        'tags': tags,
-                    }
+                    # Publish to Piwigo
+                    try:
+                        tags = ','.join(keywords)
+                        payload = {
+                            'category': 3,
+                            'name': title,
+                            'author': author,
+                            'comment': description,
+                            'tags': tags,
+                        }
 
-                    with open(filepath, 'rb') as f:
-                        result = api_post(
-                            'pwg.images.addSimple',
-                            payload,
-                            files={'image': f},
-                        )
-                        piwigo_id = result['image_id']
-                        print(f'Piwigo ID: {piwigo_id}')
-                except Exception as e:
-                    failed.writerow([filepath, deposit_id, 'Piwigo addSimple', str(e)])
-                    print(f'{Colors.RED}File {filepath} failed uploading:{Colors.RESET} {str(e)}')
-                    continue
+                        with open(filepath, 'rb') as f:
+                            result = api_post(
+                                'pwg.images.addSimple',
+                                payload,
+                                files={'image': f},
+                            )
+                            piwigo_id = result['image_id']
+                            print(f'Piwigo ID: {piwigo_id}')
+                    except Exception as e:
+                        failed.writerow([filepath, deposit_id, 'Piwigo addSimple', str(e)])
+                        print(f'{Colors.RED}File {filepath} failed uploading:{Colors.RESET} {str(e)}')
+                        continue
 
-                print(f'{photo_count / total_photos * 100:.1f}% complete, {photo_count}/{total_photos}')
+                    print(f'{photo_count / total_photos * 100:.1f}% complete, {photo_count}/{total_photos}')
 
-                print() # separate photos in terminal
+                    print() # separate photos in terminal
 
-                # success
-                completed_ids.add(deposit_id)
-                completed.writerow([filepath, deposit_id, deposit_url, title, author, alt_text, keywords_cell, piwigo_id])
+                    # success
+                    completed_ids.add(deposit_id)
+                    completed.writerow([filepath, deposit_id, deposit_url, title, author, alt_text, keywords_cell, piwigo_id])
 
-            browser.close()
+            finally:
+                logout()
+                browser.close()
 
 if __name__ == '__main__':
     main()
